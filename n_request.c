@@ -796,6 +796,306 @@ void NoteErrorClean(char *errbuf)
     }
 }
 
+/*!
+ @internal
+
+ @brief Check if a JSON string contains a "cmd" field (fire-and-forget).
+
+ Uses string matching rather than JSON parsing. Safe for well-formed Notecard
+ requests where "cmd" and "req" are always top-level keys.
+
+ @param json The JSON string to check.
+
+ @returns `true` if the string contains a "cmd" field, `false` otherwise.
+ */
+NOTE_C_STATIC bool _jsonIsCommand(const char *json)
+{
+    return (strstr(json, "\"cmd\":") != NULL);
+}
+
+/*!
+ @internal
+
+ @brief Check if a JSON response string contains a specific error type.
+
+ Searches for the error type string within the "err" field value, without
+ JSON parsing.
+
+ @param rspJSON The JSON response string.
+ @param errType The error type substring to search for (e.g. "{io}").
+
+ @returns `true` if the error type is found in the "err" field, `false` otherwise.
+ */
+NOTE_C_STATIC bool _rspContainsError(const char *rspJSON, const char *errType)
+{
+    const char *errField = strstr(rspJSON, "\"err\":\"");
+    if (errField == NULL) {
+        return false;
+    }
+    const char *errStart = errField + 7;  // skip past "err":"
+    const char *errEnd = strchr(errStart, '"');
+    if (errEnd == NULL) {
+        return false;
+    }
+    size_t typeLen = strlen(errType);
+    for (const char *p = errStart; p + typeLen <= errEnd; p++) {
+        if (memcmp(p, errType, typeLen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *NoteTransactionStreaming(const char *reqJSON, size_t reqLen,
+                                     NoteResponseChunkCb rxCb, void *rxCtx)
+{
+    const uint32_t transactionTimeoutMs = (CARD_INTER_TRANSACTION_TIMEOUT_SEC * 1000);
+
+    // Validate request
+    if (reqJSON == NULL || reqLen == 0) {
+        return ERRSTR("NULL or empty request", c_bad);
+    }
+
+    // Detect cmd vs req using string matching (no JSON parse)
+    bool isCmd = _jsonIsCommand(reqJSON);
+    bool isReq = (strstr(reqJSON, "\"req\":") != NULL);
+    if (!isReq && !isCmd) {
+        return ERRSTR("neither req nor cmd found in request", c_bad);
+    }
+
+    // Ensure the Notecard is ready
+    if (!_TransactionStart(transactionTimeoutMs)) {
+        return ERRSTR("Notecard not ready (CTX/RTX) {io}", c_ioerr);
+    }
+
+    _LockNote();
+
+    // If a reset of the I/O interface is required, do it now
+    if (resetRequired) {
+        NOTE_C_LOG_DEBUG("Resetting Notecard I/O Interface...");
+        if ((resetRequired = !_Reset())) {
+            _UnlockNote();
+            _TransactionStop();
+            return ERRSTR("failed to reset Notecard interface {io}", c_iobad);
+        }
+    }
+
+    // Make a mutable copy of the request for newline manipulation and CRC
+    char *json = (char *)_Malloc(reqLen + 1);
+    if (json == NULL) {
+        _UnlockNote();
+        _TransactionStop();
+        return ERRSTR("request: malloc failed", c_mem);
+    }
+    memcpy(json, reqJSON, reqLen);
+    json[reqLen] = '\0';
+
+    // Ensure null-terminated (strip trailing newline for CRC/logging,
+    // will be re-added before transmission)
+    size_t jsonLen = reqLen;
+    if (jsonLen > 0 && json[jsonLen - 1] == '\n') {
+        json[--jsonLen] = '\0';
+    }
+
+#ifndef NOTE_C_LOW_MEM
+    // Add CRC for requests (not commands)
+    bool crcAdded = false;
+    if (isReq) {
+        char *newJson = _crcAdd(json, seqNo);
+        if (newJson != NULL) {
+            _Free(json);
+            json = newJson;
+            jsonLen = strlen(json);
+            crcAdded = true;
+        }
+    }
+#endif
+
+    // Retry loop
+    const char *errStr = NULL;
+    for (uint8_t retries = 0; retries <= CARD_REQUEST_RETRIES_ALLOWED; ++retries) {
+        errStr = NULL;
+
+        // Log the request
+        if (suppressShowTransactions == 0) {
+            NOTE_C_LOG_INFO(json);
+        }
+
+        // Append newline for transmission
+        json[jsonLen] = '\n';
+        size_t txLen = jsonLen + 1;
+
+        // Perform the transport transaction
+        char *rspStr = NULL;
+        if (isCmd) {
+            errStr = _Transaction(json, txLen, NULL, transactionTimeoutMs);
+        } else {
+            errStr = _Transaction(json, txLen, &rspStr, transactionTimeoutMs);
+        }
+
+        // Restore null terminator
+        json[jsonLen] = '\0';
+
+        // Handle transport errors
+        if (errStr != NULL) {
+            _Free(rspStr);
+            if (NoteErrorContains(errStr, c_ioerr)) {
+                NOTE_C_LOG_WARN(ERRSTR("retrying... transaction failure", c_iobad));
+                resetRequired = !_Reset();
+                _DelayMs(RETRY_DELAY_MS);
+                continue;
+            }
+            break;  // Fatal error
+        }
+
+        // Commands: no response expected
+        if (isCmd) {
+            NOTE_C_LOG_DEBUG("Command successfully sent to Notecard");
+            break;
+        }
+
+        // Validate response
+        if (rspStr == NULL) {
+            errStr = ERRSTR("response expected, but response is NULL {io}", c_ioerr);
+            NOTE_C_LOG_WARN(ERRSTR("retrying... no response", c_iobad));
+            _DelayMs(RETRY_DELAY_MS);
+            continue;
+        }
+
+#ifndef NOTE_C_LOW_MEM
+        // Check CRC on response
+        if (crcAdded && _crcError(rspStr, seqNo)) {
+            _Free(rspStr);
+            errStr = ERRSTR("CRC error {io}", c_iobad);
+            NOTE_C_LOG_WARN(ERRSTR("retrying... CRC error", c_iobad));
+            _DelayMs(RETRY_DELAY_MS);
+            continue;
+        }
+#endif
+
+        // Classify response errors using string matching
+        bool isIoError = _rspContainsError(rspStr, c_ioerr)
+                         && !_rspContainsError(rspStr, c_unsupported);
+        bool isBadBin = _rspContainsError(rspStr, c_badbinerr);
+
+        if (isIoError || isBadBin) {
+            if (isBadBin) {
+                NOTE_C_LOG_DEBUG("{bad-bin} errors not eligible for retry");
+                // Still deliver the error response to the callback
+                if (rxCb != NULL) {
+                    size_t rspLen = strlen(rspStr);
+                    rxCb(rxCtx, rspStr, rspLen);
+                }
+                _Free(rspStr);
+                errStr = NULL;  // Error is in the response, not a transport error
+                break;
+            }
+            _Free(rspStr);
+            errStr = ERRSTR("corrupt response {io}", c_ioerr);
+            NOTE_C_LOG_WARN(ERRSTR("retrying... corrupt response", c_iobad));
+            _DelayMs(RETRY_DELAY_MS);
+            continue;
+        }
+
+        // Success — deliver response to callback
+        if (suppressShowTransactions == 0) {
+            NOTE_C_LOG_INFO(rspStr);
+        }
+        if (rxCb != NULL) {
+            size_t rspLen = strlen(rspStr);
+            rxCb(rxCtx, rspStr, rspLen);
+        }
+        _Free(rspStr);
+        break;
+    }
+
+    _Free(json);
+
+#ifndef NOTE_C_LOW_MEM
+    seqNo++;
+#endif
+
+    _UnlockNote();
+    _TransactionStop();
+
+    return errStr;
+}
+
+/*!
+ @internal
+
+ @brief Callback context for NoteTransactionString buffer-copy callback.
+ */
+typedef struct {
+    char *buf;
+    size_t bufLen;
+    size_t received;
+    bool overflow;
+} _StringBufCtx;
+
+/*!
+ @internal
+
+ @brief Response callback that copies data into a caller-provided buffer.
+ */
+NOTE_C_STATIC bool _stringBufCallback(void *ctx, const char *data, size_t len)
+{
+    _StringBufCtx *s = (_StringBufCtx *)ctx;
+    s->received += len;
+    if (s->buf == NULL) {
+        return true;  // Just counting bytes
+    }
+    if (s->received > s->bufLen) {
+        // Copy what fits
+        size_t canCopy = (s->received - len < s->bufLen)
+                         ? (s->bufLen - (s->received - len)) : 0;
+        if (canCopy > 0) {
+            memcpy(s->buf + (s->received - len), data, canCopy);
+        }
+        s->overflow = true;
+        return true;  // Continue to get full length
+    }
+    memcpy(s->buf + (s->received - len), data, len);
+    return true;
+}
+
+const char *NoteTransactionString(const char *reqJSON, size_t reqLen,
+                                   char *rspBuf, size_t rspBufLen,
+                                   size_t *rspLen)
+{
+    _StringBufCtx ctx = {
+        .buf = rspBuf,
+        .bufLen = rspBufLen,
+        .received = 0,
+        .overflow = false
+    };
+
+    const char *err = NoteTransactionStreaming(
+        reqJSON, reqLen,
+        (rspBuf != NULL || rspLen != NULL) ? _stringBufCallback : NULL,
+        &ctx
+    );
+
+    if (rspLen != NULL) {
+        *rspLen = ctx.received;
+    }
+
+    if (err != NULL) {
+        return err;
+    }
+
+    if (ctx.overflow) {
+        return ERRSTR("response buffer overflow", c_bad);
+    }
+
+    // Null-terminate if there's room
+    if (rspBuf != NULL && ctx.received < rspBufLen) {
+        rspBuf[ctx.received] = '\0';
+    }
+
+    return NULL;
+}
+
 #ifndef NOTE_C_LOW_MEM
 
 /*!

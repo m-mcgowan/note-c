@@ -16,6 +16,9 @@ extern "C" {
 extern bool resetRequired;
 
 // Make these normally static functions externally visible if building tests.
+bool _jsonIsCommand(const char *json);
+bool _rspContainsError(const char *rspJSON, const char *errType);
+bool _stringBufCallback(void *ctx, const char *data, size_t len);
 char *_crcAdd(char *json, uint16_t seqno);
 bool _crcError(char *json, uint16_t shouldBeSeqno);
 void _delayIO(void);

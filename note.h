@@ -482,6 +482,73 @@ uint32_t NoteSetRequestTimeout(uint32_t overrideSecs);
  @see NoteResponseError to check the response for errors.
  */
 J *NoteTransaction(J *req);
+
+/*!
+ @brief Callback type for receiving response data from a streaming transaction.
+
+ Called with chunks of response data as they become available. The callback
+ may be called once with the complete response or multiple times with partial
+ chunks, depending on the transport implementation.
+
+ @param ctx User-provided context pointer (passed through from the transaction call).
+ @param data Pointer to the response data chunk. Valid only for the duration of the callback.
+ @param len Length of the data chunk in bytes.
+
+ @returns `true` to continue receiving data, `false` to abort the transaction.
+ */
+typedef bool (*NoteResponseChunkCb)(void *ctx, const char *data, size_t len);
+/*!
+ @brief Perform a string-based transaction with the Notecard, streaming the
+        response to a callback.
+
+ This is the lowest-level string transaction API. It handles the full
+ transaction lifecycle (locking, I/O reset, CRC integrity checking, retries
+ on I/O errors, and cmd vs req detection) while allowing the caller to
+ receive the response via a callback — avoiding the need for the caller to
+ allocate a response buffer.
+
+ @param reqJSON A newline-terminated JSON C-string containing the request.
+        Must contain either a "req" or "cmd" field. The caller retains
+        ownership — this string is not freed by the function.
+ @param reqLen Length of reqJSON in bytes (including the newline).
+ @param rxCb Callback invoked with response data. May be NULL if no response
+        is needed (e.g. for "cmd" fire-and-forget requests).
+ @param rxCtx Opaque context pointer passed through to rxCb.
+
+ @returns NULL on success, or a c-string error message on failure.
+
+ @see NoteTransactionString for a buffer-based wrapper.
+ @see NoteTransaction for the J*-based equivalent.
+ */
+const char *NoteTransactionStreaming(const char *reqJSON, size_t reqLen,
+                                     NoteResponseChunkCb rxCb, void *rxCtx);
+/*!
+ @brief Perform a string-based transaction with the Notecard, writing the
+        response into a caller-provided buffer.
+
+ Built on NoteTransactionStreaming. Copies the response into the provided
+ buffer. If the response exceeds the buffer size, returns an overflow error
+ and sets *rspLen to the required size so the caller can retry with a larger
+ buffer.
+
+ @param reqJSON A newline-terminated JSON C-string containing the request.
+ @param reqLen Length of reqJSON in bytes (including the newline).
+ @param rspBuf Caller-provided buffer for the response. May be NULL if no
+        response is needed (e.g. for "cmd" requests).
+ @param rspBufLen Size of rspBuf in bytes.
+ @param rspLen [out] Set to the actual response length on success, or the
+        required buffer size on overflow. May be NULL if the caller does not
+        need the length.
+
+ @returns NULL on success, or a c-string error message on failure.
+        Returns "overflow {bad}" if the response exceeds rspBufLen.
+
+ @see NoteTransactionStreaming for the callback-based API.
+ @see NoteRequestResponseJSON for the allocating convenience API.
+ */
+const char *NoteTransactionString(const char *reqJSON, size_t reqLen,
+                                   char *rspBuf, size_t rspBufLen,
+                                   size_t *rspLen);
 /*!
  @brief Check if an error string contains a specific error type.
 
